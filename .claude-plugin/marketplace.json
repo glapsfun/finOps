@@ -1,0 +1,26 @@
+{
+  "name": "finops",
+  "description": "FinOps reports for AWS, GCP, and Kubernetes with every number proved against saved query results. Distributed as a Claude Code plugin and as a standard Agent Skill",
+  "owner": {
+    "name": "vladtara",
+    "email": "vlad@glaps.fun"
+  },
+  "plugins": [
+    {
+      "name": "finops",
+      "source": "./plugins/finops",
+      "description": "Answers cloud cost questions on AWS, GCP, and Kubernetes: why a bill went up, whether analysis matches an invoice, where to save money, and a recurring report compared with the last one. Every number in a report is proved against saved query results.",
+      "category": "cloud-native",
+      "tags": [
+        "finops",
+        "cloud-cost",
+        "billing",
+        "aws",
+        "gcp",
+        "kubernetes",
+        "opencost",
+        "kubecost"
+      ]
+    }
+  ]
+}

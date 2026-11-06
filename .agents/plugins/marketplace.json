@@ -1,0 +1,20 @@
+{
+  "name": "finops",
+  "interface": {
+    "displayName": "FinOps"
+  },
+  "plugins": [
+    {
+      "name": "finops",
+      "source": {
+        "source": "local",
+        "path": "./plugins/finops"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}
