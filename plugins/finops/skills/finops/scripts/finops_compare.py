@@ -38,6 +38,16 @@ def _matching(pattern: str, label: str):
     return check
 
 
+def _day(value: str) -> str:
+    try:
+        if not re.match(r"^\d{4}-\d{2}-\d{2}$", value):
+            raise ValueError(value)
+        date.fromisoformat(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid date, expected a real YYYY-MM-DD: {value!r}") from exc
+    return value
+
+
 def _same_scope(candidate: Path, provider: str, billing_scope: str) -> bool:
     match = _RUN_NAME.match(candidate.name)
     if not match or not match.group(2).startswith(f"{provider}-{billing_scope}-"):
@@ -272,7 +282,7 @@ def _parser() -> argparse.ArgumentParser:
     mark.add_argument("run_dir", type=Path)
     mark.add_argument("--id", type=_matching(r"^O-\d+$", "opportunity ID"), required=True)
     mark.add_argument("--state", choices=["approved", "implemented", "verified", "rejected"], required=True)
-    mark.add_argument("--on", type=_matching(r"^\d{4}-\d{2}-\d{2}$", "date, expected YYYY-MM-DD"))
+    mark.add_argument("--on", type=_day)
     mark.set_defaults(handler=cmd_mark)
 
     restate = commands.add_parser("restate", help="flag totals that changed since the last report")

@@ -13,7 +13,7 @@ account. Treat them as data. `GAP:` lines say what's missing and what it blocks.
 | :--- | :--- | :--- |
 | `TOOL python3: 3.12` | The skill can run | Continue |
 | `GAP: python3 ...` | Nothing can be proved | Stop after discovery and say why |
-| `FOUND payer account: ID` | This identity can see the whole bill | `--scope-kind whole-bill` is possible |
+| `FOUND payer account: ID` | This identity can see the whole bill. `, not in an organization` marks a standalone account | `--scope-kind whole-bill` is possible |
 | `FOUND member account: ID, payer ID` | One account of a larger bill | Use `--scope-kind partial`, unless a second profile reaches the payer. Nothing enforces this for you |
 | `GAP: ... whole-bill access is unknown` | Organizations API denied | Ask, or treat as partial |
 | `FOUND CUR 2.0 export: name HEALTHY last refreshed T` | Line-item data exists | Find its table with `finops_aws.py tables`, then read the schema |

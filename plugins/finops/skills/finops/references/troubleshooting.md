@@ -25,7 +25,7 @@ These are hypotheses to test, not findings about a particular account.
 | `LOCATOR_FAILED` on a CSV figure | The `where` matches no row or several | Add the columns that make the row unique |
 | Status is "Not reconciled" by a small amount | Rounding, a Marketplace invoice left out, or an after-tax invoice figure | Sum all invoices for the period, and compare before tax |
 | `RECON_ROLE` on a figure that looks right | It came from the wrong place: another period, a calculation, or query results where an invoice belongs | The evidence entry's `role` and `period` |
-| `BUDGET:` says a query's use is unknown | An earlier query outlived its status check | Wait for it and rerun. Don't start it again by hand |
+| `BUDGET:` says a query's use is unknown | An earlier query outlived its status check | Wait for it and run the same command again, which collects its result. Don't start it again by hand |
 | `PAST_WINDOW` on a saving that looks right | An input comes from another month, or from evidence with no period | Use the months `finops_compare.py mark` prints, and a query that takes a period |
 
 [GCP schema and timing](https://docs.cloud.google.com/billing/docs/how-to/export-data-bigquery-tables/detailed-usage),

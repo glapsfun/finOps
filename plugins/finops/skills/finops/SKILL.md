@@ -65,7 +65,8 @@ Status: <from the validator, once it has run>
 Scripts are in `scripts/`. They need `python3` 3.9 or newer, except discovery. A script
 that prints `GAP:` has recorded what's missing, so carry on with what remains. Exit 2 is a
 usage error or a refused query. Exit 3 with `BUDGET:` means stop: the budget is used up, or
-an earlier query's use isn't known yet. Never start a query again because its status was lost.
+an earlier query's use isn't known yet. Never start a query by hand because its status was lost:
+run the same script command again, which collects the result without paying for a second query.
 
 ### 1. Scope
 

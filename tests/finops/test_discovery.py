@@ -126,6 +126,14 @@ class Aws(DiscoveryCase):
         done = self.discover("aws")
         self.assertRegex(done.stdout, r"(?m)^GAP: .*whole-bill access is unknown")
 
+    def test_an_account_outside_any_organization_is_its_own_payer(self):
+        self.stub_all()
+        error = "An error occurred (AWSOrganizationsNotInUseException) when calling the DescribeOrganization operation: Your account is not a member of an organization."
+        self.scenario.responses[1].update(stdout="", stderr=error, exit=254)
+        done = self.discover("aws")
+        self.assertIn("FOUND payer account: 123456789012, not in an organization", done.stdout)
+        self.assertNotIn("GAP:", done.stdout)
+
     def test_billing_endpoints_are_pinned_whatever_the_ambient_region(self):
         self.stub_all()
         done = run_script(SCRIPT, "aws", env={**self.scenario.env(path=make_path(self.tmp)), "AWS_REGION": "eu-west-1"})
@@ -306,6 +314,19 @@ class Kubernetes(DiscoveryCase):
         self.stub("kubecost\tkubecost-cost-analyzer\tgcr.io/kubecost1/cost-model:prod-2.4.1 gcr.io/kubecost1/frontend:prod-2.4.1 \n", "kubecost kubecost-cost-analyzer 9003,9090\n")
         done = self.discover("k8s")
         self.assertIn("FOUND kubecost self-hosted: version 2.4.1 kubecost/kubecost-cost-analyzer:9090", done.stdout)
+
+    def test_kubecost_prefers_the_cost_analyzer_service(self):
+        services = "kubecost kubecost-aggregator 9004\nkubecost kubecost-cloud-cost 9005\nkubecost kubecost-cost-analyzer 9003,9090\n"
+        self.stub("kubecost\tkubecost-cost-analyzer\tgcr.io/kubecost1/cost-model:prod-2.4.1 gcr.io/kubecost1/frontend:prod-2.4.1 \n", services)
+        done = self.discover("k8s")
+        self.assertIn("FOUND kubecost self-hosted: version 2.4.1 kubecost/kubecost-cost-analyzer:9090", done.stdout)
+
+    def test_a_long_service_list_still_reports(self):
+        filler = "".join(f"team-{index} service-{index}-{'x' * 30} 80,443\n" for index in range(4000))
+        self.stub("opencost\topencost\tghcr.io/opencost/opencost:1.113.0 \n", "opencost opencost 9003,9090\n" + filler)
+        done = self.discover("k8s")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("FOUND opencost: version 1.113.0 opencost/opencost:9003", done.stdout)
 
     def test_kubecost_with_no_parsable_version_is_a_gap(self):
         self.stub("kubecost\tkubecost-cost-analyzer\tgcr.io/kubecost1/cost-model:latest \n", "kubecost kubecost-cost-analyzer 9090\n")

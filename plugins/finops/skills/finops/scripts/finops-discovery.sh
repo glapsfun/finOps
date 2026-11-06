@@ -144,13 +144,17 @@ cmd_aws() {
 }
 
 discover_aws_payer() {
-  local account="$1" payer
-  if payer="$("${AWS_CMD[@]}" organizations describe-organization --query 'Organization.MasterAccountId' --output text 2>/dev/null)" && ! is_empty_result "$payer"; then
-    if [[ "$payer" == "$account" ]]; then
-      found "payer account" "$account"
-    else
-      found "member account" "${account}, payer ${payer}"
-    fi
+  local account="$1" output payer=""
+  # stderr is kept: it is the only place AWS says an account has no organization.
+  if output="$("${AWS_CMD[@]}" organizations describe-organization --query 'Organization.MasterAccountId' --output text 2>&1)"; then
+    payer="$(grep -m 1 -xE '[0-9]{12}' <<<"$output" || true)"
+  fi
+  if [[ -n "$payer" && "$payer" == "$account" ]]; then
+    found "payer account" "$account"
+  elif [[ -n "$payer" ]]; then
+    found "member account" "${account}, payer ${payer}"
+  elif [[ "$output" == *AWSOrganizationsNotInUseException* ]]; then
+    found "payer account" "${account}, not in an organization"
   else
     gap "can't read the organization, so whole-bill access is unknown: a member account can only report a partial scope"
   fi
@@ -443,18 +447,26 @@ classify_deployment() {
     return 0
   fi
 
-  local service port
-  service="$(printf '%s\n' "$services" | awk -v ns="$namespace" -v want="${tool%% *}|cost-analyzer" '$1 == ns && $2 ~ want {print $2; exit}')"
+  # Kubecost serves its API from cost-analyzer, and its other services also carry its name.
+  local service port first="cost-analyzer" second="${tool%% *}"
+  if [[ "$tool" == "opencost" ]]; then
+    first="opencost" second="cost-analyzer"
+  fi
+  # Here-strings, because a pipe writer is killed when awk stops reading a long list early.
+  service="$(awk -v ns="$namespace" -v first="$first" -v second="$second" '
+    $1 == ns && $2 ~ first && a == "" { a = $2 }
+    $1 == ns && $2 ~ second && b == "" { b = $2 }
+    END { print (a != "" ? a : b) }' <<<"$services")"
   if [[ -z "$service" ]]; then
     gap "${tool} ${version} in ${namespace} has no matching service, so its API can't be reached"
     return 0
   fi
-  port="$(printf '%s\n' "$services" | awk -v ns="$namespace" -v svc="$service" -v want="$default_port" '
+  port="$(awk -v ns="$namespace" -v svc="$service" -v want="$default_port" '
     $1 == ns && $2 == svc {
       count = split($3, ports, ",")
       for (i = 1; i <= count; i++) { if (ports[i] == want) { print want; exit } }
       print ports[1]; exit
-    }')"
+    }' <<<"$services")"
   found "$tool" "version ${version} ${namespace}/${service}:${port}"
   return 0
 }

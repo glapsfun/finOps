@@ -38,6 +38,8 @@ DEFAULT_CATALOG = "AwsDataCatalog"
 EXIT_USAGE = 2
 EXIT_BUDGET = 3
 RESULT_PAGE_ITEMS = "1000"
+# One throttled status check shouldn't cost a query its result.
+POLL_ATTEMPTS = 3
 TERMINAL_STATES = {"SUCCEEDED", "FAILED", "CANCELLED"}
 METRICS = ["UnblendedCost", "AmortizedCost", "NetAmortizedCost", "NetUnblendedCost", "BlendedCost", "UsageQuantity"]
 # The metric decides the basis. The others have none, so they can't reconcile to a bill.
@@ -209,17 +211,23 @@ def _wait_for_query(args, query_id: str) -> dict | None:
     poll = float(os.environ.get("FINOPS_POLL_SECONDS", "2"))
     limit = float(os.environ.get("FINOPS_POLL_LIMIT", "300"))
     deadline = time.monotonic() + limit
+    failures = 0
     while True:
-        code, out, err = run_cli(_aws(args, "athena", "get-query-execution", "--query-execution-id", query_id))
+        code, out, _ = run_cli(_aws(args, "athena", "get-query-execution", "--query-execution-id", query_id))
         if code:
-            gap(f"Athena query {query_id} started, but its status couldn't be read. Its use isn't counted yet, and the next query checks it first. Don't start it again", args.run_dir)
+            failures += 1
+            if failures < POLL_ATTEMPTS:
+                time.sleep(poll)
+                continue
+            gap(f"Athena query {query_id} started, but its status couldn't be read. Its use isn't counted yet. Run this same command again to collect its result, which won't start a second query", args.run_dir)
             return None
+        failures = 0
         execution = json.loads(out).get("QueryExecution", {})
         state = execution.get("Status", {}).get("State", "")
         if state in TERMINAL_STATES:
             return execution
         if time.monotonic() >= deadline:
-            gap(f"Athena query {query_id} is still {state} after {limit:g} seconds. Its use isn't counted yet, and the next query checks it first. Don't start it again", args.run_dir)
+            gap(f"Athena query {query_id} is still {state} after {limit:g} seconds. Its use isn't counted yet. Run this same command again once it finishes to collect its result, which won't start a second query", args.run_dir)
             return None
         time.sleep(poll)
 
@@ -250,19 +258,69 @@ def _to_csv(rows: list) -> str:
     return buffer.getvalue()
 
 
-def _settle_pending(args) -> str | None:
-    """Charges queries an earlier call lost track of. Returns why a new one can't start."""
+def _collect(args, query_id: str, execution: dict, query: dict | None) -> bool:
+    """Charges a finished query and records its result. True when evidence was written."""
+    scanned = int(execution.get("Statistics", {}).get("DataScannedInBytes", 0))
+    # Failed and cancelled queries are still charged for what they scanned.
+    charged = settle_query(args.run_dir, "athena_bytes", query_id, scanned)
+    status = execution.get("Status", {})
+    if status.get("State") != "SUCCEEDED":
+        gap(f"Athena query {query_id} {status.get('State')}: {status.get('StateChangeReason', 'no reason given')}", args.run_dir)
+        return False
+    # An overlapping call that charged it first records it, and an entry with no query can't be.
+    if not charged or query is None:
+        return False
+
+    rows, complete = _fetch_results(args, query_id)
+    text = _to_csv(rows)
+    evidence_id = add_evidence(
+        args.run_dir,
+        kind="billing",
+        source=query["source"],
+        command=f"aws athena start-query-execution --work-group {query['workgroup']} --query-execution-context Database={query['database']}",
+        raw=text.encode(),
+        ext="csv",
+        query_text=query["sql"],
+        identity=query["profile"],
+        job_id=query_id,
+        used=fmt_bytes(scanned),
+        basis=query["basis"],
+        complete=complete,
+        rows=max(len(rows) - 1, 0),
+        role="query",
+        period=query["period"],
+    )
+    show_result(args.run_dir, evidence_id, query["name"], text)
+    if complete:
+        empty_result_gap(", ".join(filter(None, [query["name"], query["period"]])), rows, args.run_dir)
+    return True
+
+
+def _settle_pending(args, sql: str) -> tuple:
+    """Charges queries an earlier call lost track of, and records their results.
+    Returns why a new query can't start, and whether this same query was just collected."""
+    collected = False
     for item in pending_queries(args.run_dir, "athena"):
         job = item["job_id"]
         code, out, _ = run_cli(_aws(args, "athena", "get-query-execution", "--query-execution-id", job))
         if code:
-            return f"Athena query {job} can't be checked, so its use is unknown. Try again once it can be"
+            return f"Athena query {job} can't be checked, so its use is unknown. Try again once it can be", collected
         execution = json.loads(out).get("QueryExecution", {})
         state = execution.get("Status", {}).get("State", "")
         if state not in TERMINAL_STATES:
-            return f"Athena query {job} is still {state}, so its use is unknown. Try again when it finishes"
-        settle_query(args.run_dir, "athena_bytes", job, int(execution.get("Statistics", {}).get("DataScannedInBytes", 0)))
-    return None
+            return f"Athena query {job} is still {state}, so its use is unknown. Try again when it finishes", collected
+        query = item.get("query")
+        if _collect(args, job, execution, query) and query["sql"] == sql:
+            collected = True
+    return None, collected
+
+
+def _within_budget(args) -> int:
+    try:
+        require_budget(load_run(args.run_dir), "athena_bytes", 0)
+    except BudgetError as exc:
+        return _budget_stop(exc)
+    return 0
 
 
 def cmd_athena(args) -> int:
@@ -270,9 +328,12 @@ def cmd_athena(args) -> int:
     sql = load_query(args.query_file, params)
     check_read_only(sql)
     check_bounded(sql, args.partition_column)
-    unsettled = _settle_pending(args)
+    unsettled, collected = _settle_pending(args, sql)
     if unsettled:
         return _budget_stop(unsettled)
+    # The result this command asks for was already paid for, so it isn't run again.
+    if collected:
+        return _within_budget(args)
     run = load_run(args.run_dir)
     try:
         require_budget(run, "athena_bytes", 1)
@@ -286,48 +347,22 @@ def cmd_athena(args) -> int:
         gap(failure_reason(label, code, err), args.run_dir)
         return 0
     query_id = json.loads(out)["QueryExecutionId"]
-    add_pending(args.run_dir, "athena", query_id)
+    query = {
+        "name": args.query_file.name,
+        "sql": sql,
+        "source": args.source or f"Athena, {args.query_file.stem}",
+        "basis": args.basis or default_basis(args.query_file),
+        "period": _query_period(params),
+        "workgroup": args.workgroup,
+        "database": args.database,
+        "profile": args.profile or "",
+    }
+    add_pending(args.run_dir, "athena", query_id, query=query)
 
     execution = _wait_for_query(args, query_id)
-    if execution is None:
+    if execution is None or not _collect(args, query_id, execution, query):
         return 0
-    scanned = int(execution.get("Statistics", {}).get("DataScannedInBytes", 0))
-    # Failed and cancelled queries are still charged for what they scanned.
-    settle_query(args.run_dir, "athena_bytes", query_id, scanned)
-    status = execution.get("Status", {})
-    if status.get("State") != "SUCCEEDED":
-        gap(f"Athena query {query_id} {status.get('State')}: {status.get('StateChangeReason', 'no reason given')}", args.run_dir)
-        return 0
-
-    rows, complete = _fetch_results(args, query_id)
-    text = _to_csv(rows)
-    evidence_id = add_evidence(
-        args.run_dir,
-        kind="billing",
-        source=args.source or f"Athena, {args.query_file.stem}",
-        command=f"aws athena start-query-execution --work-group {args.workgroup} --query-execution-context Database={args.database}",
-        raw=text.encode(),
-        ext="csv",
-        query_text=sql,
-        identity=args.profile or "",
-        job_id=query_id,
-        used=fmt_bytes(scanned),
-        basis=args.basis or default_basis(args.query_file),
-        complete=complete,
-        rows=max(len(rows) - 1, 0),
-        role="query",
-        period=_query_period(params),
-    )
-    show_result(args.run_dir, evidence_id, args.query_file.name, text)
-    if complete:
-        empty_result_gap(", ".join(filter(None, [args.query_file.name, _query_period(params)])), rows, args.run_dir)
-
-    run = load_run(args.run_dir)
-    try:
-        require_budget(run, "athena_bytes", 0)
-    except BudgetError as exc:
-        return _budget_stop(exc)
-    return 0
+    return _within_budget(args)
 
 
 def _paged_cost_explorer(args, base: list, token_names: tuple | None) -> tuple:

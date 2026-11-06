@@ -65,8 +65,9 @@ A `LIMIT` doesn't reduce a scan on a non-clustered table. The prepared queries f
 
 On capacity pricing, the bytes limit has no direct dollar meaning, and the script records a gap
 saying so. If `bq` times out or fails here, the job may still be running: it stays pending, and the next
-query checks it first and charges it, or charges the estimate if the job can't be read. Only the
-bytes-limit failure is known to be free.
+query checks it first and charges it, or charges the estimate if the job can't be read. A job that
+finished has its result recorded then, and running the same command again collects it instead of
+a second query. Only the bytes-limit failure is known to be free.
 
 [BigQuery cost controls](https://docs.cloud.google.com/bigquery/docs/best-practices-costs)
 

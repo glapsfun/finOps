@@ -9,12 +9,13 @@ from concurrent.futures import ProcessPoolExecutor
 from datetime import date
 from pathlib import Path
 
-from support import SCRIPTS, add_provided_figure, build_valid_run, recompute, run_script
+from support import SCRIPTS, add_ledger, add_provided_figure, build_valid_run, recompute, run_script
 from test_compare import make_prior
-from test_proof_bypasses import Runners
+from test_proof_bypasses import Runners, execution
 
 import finops_guard
-from finops_guard import GuardError, add_pending, check_bounded, record_use
+from finops_calc import display_number
+from finops_guard import GuardError, add_pending, check_bounded, check_read_only, record_use
 from finops_record import RecordError, add_evidence, init_run, load_run, merge, save_run
 from finops_report import render
 from finops_validate import validate
@@ -469,3 +470,309 @@ class CalculationCycle(ValidRunCase):
 
     def test_a_calculation_built_on_another_is_not_a_cycle(self):
         self.assertNotIn("CALC_CYCLE", self.codes())
+
+
+def _calc(run, calc_id):
+    return next(item for item in run["calculations"] if item["id"] == calc_id)
+
+
+class PoolDistributionSource(ValidRunCase):
+    """A pool is conserved only if its calculation splits the pool the ledger names."""
+
+    def test_a_calculation_over_another_pool_is_refused(self):
+        def change(run):
+            add_ledger(run)
+            _calc(run, "C21")["inputs"]["pool"] = "shared_pool"
+            recompute(run, _calc(run, "C21"))
+            recompute(run, _calc(run, "C20"))
+
+        self.edit(change)
+        self.assertIn("POOL_SUM", self.codes())
+
+    def test_a_distributed_row_must_belong_to_a_distribution(self):
+        def change(run):
+            add_ledger(run)
+            run["kubernetes_ledger"]["distributions"] = []
+
+        self.edit(change)
+        self.assertIn("POOL_SUM", self.codes())
+
+    def test_the_design_ledger_passes(self):
+        self.edit(add_ledger)
+        self.assertEqual(validate(self.run_dir), [])
+
+
+class SavingsTotalTerms(ValidRunCase):
+    """The heading's total is the opportunities listed under it, each counted once."""
+
+    def terms(self, *terms):
+        def change(run):
+            _calc(run, "C14")["inputs"]["terms"] = list(terms)
+            recompute(run, _calc(run, "C14"))
+
+        self.edit(change)
+
+    def overlap(self, run):
+        overlap = {"id": "C30", "name": "overlap_savings", "kind": "estimated", "assumptions": [], "inputs": {"baseline": "oct_query_total", "reductions": [{"literal": "0.2", "assumption": "a"}, {"literal": "0.3", "assumption": "b"}]}}
+        recompute(run, overlap)
+        run["calculations"].append(overlap)
+        run["opportunities"][2]["resource"] = "nat-gateway"
+        run["opportunities"][0]["overlap_calc"] = "C30"
+        run["opportunities"][2]["overlap_calc"] = "C30"
+
+    def test_a_term_that_is_no_opportunity_is_refused(self):
+        self.terms("C12.total", "e7_search", "C13.total", "prior_O-12_estimate")
+        self.assertIn("SAVINGS_KIND", self.codes())
+
+    def test_a_missing_opportunity_is_refused(self):
+        self.terms("e7_search")
+        self.assertIn("SAVINGS_KIND", self.codes())
+
+    def test_an_opportunity_counted_twice_is_refused(self):
+        self.terms("C12.total", "e7_search", "C13.total", "C13.total")
+        self.assertIn("SAVINGS_KIND", self.codes())
+
+    def test_a_percentage_is_not_a_total(self):
+        def change(run):
+            self.overlap(run)
+            run["opportunities"][1]["overlap_calc"] = "C30"
+            run["savings_total"] = "C30.savings_pct"
+
+        self.edit(change)
+        self.assertIn("SAVINGS_KIND", self.codes())
+
+    def test_a_nested_sum_of_the_opportunities_passes(self):
+        def change(run):
+            inner = {"id": "C40", "name": "sum", "kind": "estimated", "assumptions": [], "inputs": {"terms": ["C12.total", "C13.total"]}}
+            recompute(run, inner)
+            run["calculations"].append(inner)
+            _calc(run, "C14")["inputs"]["terms"] = ["C40.total", "e7_search"]
+            recompute(run, _calc(run, "C14"))
+
+        self.edit(change)
+        self.assertEqual(validate(self.run_dir), [])
+
+    def test_an_overlap_calculation_stands_in_for_its_opportunities(self):
+        def change(run):
+            self.overlap(run)
+            _calc(run, "C14")["inputs"]["terms"] = ["C30.savings", "e7_search"]
+            recompute(run, _calc(run, "C14"))
+
+        self.edit(change)
+        self.assertEqual(validate(self.run_dir), [])
+
+    def test_a_net_benefit_over_the_whole_total_passes(self):
+        def change(run):
+            add_provided_figure(run, "running_cost", "200.00")
+            net = {"id": "C31", "name": "net_benefit", "kind": "estimated", "assumptions": [], "inputs": {"savings": "C14.total", "recurring": "running_cost"}}
+            recompute(run, net)
+            run["calculations"].append(net)
+            run["savings_total"] = "C31.net"
+
+        self.edit(change)
+        self.assertEqual(validate(self.run_dir), [])
+
+    def test_a_net_benefit_over_part_of_the_total_is_refused(self):
+        def change(run):
+            add_provided_figure(run, "running_cost", "200.00")
+            net = {"id": "C31", "name": "net_benefit", "kind": "estimated", "assumptions": [], "inputs": {"savings": "e7_search", "recurring": "running_cost"}}
+            recompute(run, net)
+            run["calculations"].append(net)
+            run["savings_total"] = "C31.net"
+
+        self.edit(change)
+        self.assertIn("SAVINGS_KIND", self.codes())
+
+
+class InvoiceCountedOnce(ValidRunCase):
+    """Covering every invoice means each one once, not the right number of terms."""
+
+    def invoice_sum(self, *terms):
+        def change(run):
+            total = {"id": "C60", "name": "sum", "kind": "calculated", "assumptions": [], "inputs": {"terms": list(terms)}}
+            recompute(run, total)
+            run["calculations"].append(total)
+            run["reconciliation"][0].update(invoice="C60.total", residual=None)
+
+        return change
+
+    def test_a_sum_repeating_one_invoice_is_refused(self):
+        self.edit(self.invoice_sum("oct_invoice", "oct_invoice"))
+        self.assertIn("RECON_ROLE", self.codes())
+
+    def test_two_figures_reading_one_invoice_are_refused(self):
+        def change(run):
+            run["figures"]["oct_invoice_again"] = dict(run["figures"]["oct_invoice"])
+            self.invoice_sum("oct_invoice", "oct_invoice_again")(run)
+
+        self.edit(change)
+        self.assertIn("RECON_ROLE", self.codes())
+
+    def test_a_provided_invoice_repeated_is_refused(self):
+        def change(run):
+            add_provided_figure(run, "typed_invoice", "56940.00")
+            self.invoice_sum("typed_invoice", "typed_invoice")(run)
+
+        self.edit(change)
+        self.assertIn("RECON_ROLE", self.codes())
+
+
+class CommentsSeparateTokens(unittest.TestCase):
+    """A comment ends a token, as it does for the engine that runs the query."""
+
+    def test_a_comment_does_not_hide_the_table_read(self):
+        with self.assertRaises(GuardError):
+            check_bounded("SELECT a/**/FROM cur WHERE x = 1", PARTITION)
+
+    def test_a_comment_does_not_hide_a_forbidden_keyword(self):
+        with self.assertRaises(GuardError):
+            check_read_only("SELECT a FROM t WHERE b IN (DELETE/**/FROM u)")
+
+    def test_a_comment_beside_the_partition_column_still_counts(self):
+        check_bounded("SELECT a FROM t WHERE/* this month */billing_period = 'x'", PARTITION)
+
+
+class LostQueryResult(Runners):
+    """A query that was paid for is collected, not paid for a second time."""
+
+    ROWS = json.dumps({"ResultSet": {"Rows": [{"Data": [{"VarCharValue": "a"}]}, {"Data": [{"VarCharValue": "1"}]}]}})
+
+    def start(self, query_id="qid-1"):
+        self.scenario.on("aws", "athena", "start-query-execution", stdout=json.dumps({"QueryExecutionId": query_id}))
+
+    def test_one_failed_status_check_is_tried_again(self):
+        self.approve()
+        self.start()
+        self.scenario.on("aws", "athena", "get-query-execution", stderr="ThrottlingException", exit=255)
+        self.scenario.on("aws", "athena", "get-query-execution", stdout=execution("SUCCEEDED", 5))
+        self.scenario.on("aws", "athena", "get-query-results", stdout=self.ROWS)
+        done = self.athena()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(len(self.evidence()), 1)
+        self.assertEqual(load_run(self.run_dir)["budget"]["pending"], [])
+        self.assertNotIn("GAP:", done.stdout)
+
+    def test_the_same_command_collects_the_result_without_a_second_query(self):
+        self.approve()
+        self.start()
+        self.scenario.on("aws", "athena", "get-query-execution", stdout=execution("RUNNING"))
+        first = self.athena()
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(self.evidence(), [])
+
+        self.scenario.responses[-1]["match"] = ["never"]
+        self.scenario.on("aws", "athena", "get-query-execution", "qid-1", stdout=execution("SUCCEEDED", 777))
+        self.scenario.on("aws", "athena", "get-query-results", "qid-1", stdout=self.ROWS)
+        again = self.athena()
+        self.assertEqual(again.returncode, 0, again.stdout)
+        self.assertEqual(len(self.scenario.called("aws", "start-query-execution")), 1)
+        self.assertEqual(self.used("athena_bytes"), 777)
+        evidence = self.evidence()
+        self.assertEqual([(entry["job_id"], entry["role"], entry["period"], entry["basis"]) for entry in evidence], [("qid-1", "query", "2026-10", "billed")])
+        self.assertEqual(load_run(self.run_dir)["budget"]["pending"], [])
+
+    def test_another_query_collects_the_lost_one_and_then_runs(self):
+        self.approve()
+        self.start()
+        self.scenario.on("aws", "athena", "get-query-execution", stdout=execution("RUNNING"))
+        self.athena()
+
+        self.scenario.responses[-1]["match"] = ["never"]
+        self.scenario.on("aws", "athena", "get-query-execution", "qid-1", stdout=execution("SUCCEEDED", 777))
+        self.scenario.on("aws", "athena", "get-query-results", "qid-1", stdout=self.ROWS)
+        self.start("qid-2")
+        self.scenario.on("aws", "athena", "get-query-execution", "qid-2", stdout=execution("SUCCEEDED", 5))
+        self.scenario.on("aws", "athena", "get-query-results", "qid-2", stdout=self.ROWS)
+        other = self.aws("athena", self.run_dir, "--workgroup", "finops", "--database", "billing", "--query-file", SQL / "aws-cur2-effective.sql", "--param", "table=cur", "--param", "period=2026-10")
+        self.assertEqual(other.returncode, 0, other.stdout)
+        self.assertEqual([(entry["job_id"], entry["basis"]) for entry in self.evidence()], [("qid-1", "billed"), ("qid-2", "effective")])
+        self.assertEqual(self.used("athena_bytes"), 782)
+
+    def test_a_lost_query_that_failed_says_so(self):
+        self.approve()
+        self.start()
+        self.scenario.on("aws", "athena", "get-query-execution", stdout=execution("RUNNING"))
+        self.athena()
+
+        self.scenario.responses[-1]["match"] = ["never"]
+        self.scenario.on("aws", "athena", "get-query-execution", "qid-1", stdout=execution("FAILED", 40))
+        self.start("qid-2")
+        self.scenario.on("aws", "athena", "get-query-execution", "qid-2", stdout=execution("SUCCEEDED", 5))
+        self.scenario.on("aws", "athena", "get-query-results", "qid-2", stdout=self.ROWS)
+        again = self.athena()
+        self.assertRegex(again.stdout, r"(?m)^GAP: Athena query qid-1 FAILED")
+        self.assertEqual([entry["job_id"] for entry in self.evidence()], ["qid-2"])
+        self.assertEqual(self.used("athena_bytes"), 45)
+
+    def test_a_bigquery_job_that_finished_unseen_is_collected(self):
+        self.approve()
+        s = self.scenario
+        s.on("bq", "query", "--dry_run", stdout=json.dumps({"statistics": {"query": {"totalBytesProcessed": "1000"}}}))
+        s.on("bq", "query", "--max_rows=1000000", stderr="Connection reset by peer", exit=1)
+        first = self.bq_query()
+        self.assertEqual(first.returncode, 0, first.stderr)
+        job_id = load_run(self.run_dir)["budget"]["pending"][0]["job_id"]
+
+        s.on("bq", "show", "-j", stdout=json.dumps({"status": {"state": "DONE"}, "statistics": {"query": {"totalBytesBilled": "4000"}}}))
+        s.on("bq", "head", "-j", job_id, stdout="a\n1\n")
+        again = self.bq_query()
+        self.assertEqual(again.returncode, 0, again.stdout)
+        self.assertEqual(len(s.called("bq", "query", "--max_rows=1000000")), 1)
+        self.assertEqual([(entry["job_id"], entry["role"], entry["period"], entry["rows"]) for entry in self.evidence()], [(job_id, "query", "2026-10", 1)])
+        self.assertEqual(self.used("bigquery_bytes"), 4000)
+        self.assertEqual(load_run(self.run_dir)["budget"]["pending"], [])
+
+
+class DisplayedNumbers(unittest.TestCase):
+    """A printed formula has to agree with the result printed beside it."""
+
+    def test_long_decimals_round_rather_than_truncate(self):
+        self.assertEqual(display_number("1.9999999"), "2.00")
+        self.assertEqual(display_number("0.6666666666"), "0.666667")
+        self.assertEqual(display_number("-1234.5678915"), "-1,234.567892")
+
+    def test_a_small_rate_is_not_shown_as_zero(self):
+        self.assertEqual(display_number("0.0000004"), "0.0000004")
+        self.assertEqual(display_number("0.00000012345"), "0.000000123")
+
+    def test_ordinary_values_are_unchanged(self):
+        for value, shown in (("200000", "200,000"), ("0.4", "0.4"), ("0.045", "0.045"), ("56940.00", "56,940.00"), ("4500.000", "4,500.00"), ("0.000000", "0.00")):
+            with self.subTest(value=value):
+                self.assertEqual(display_number(value), shown)
+
+
+class DatesThatDoNotExist(ValidRunCase):
+    """A date with the right shape can still be no date at all."""
+
+    INIT = ("--provider", "aws", "--billing-scope", "1", "--scope-kind", "whole-bill", "--currency", "USD", "--question", "q")
+
+    def init(self, *periods):
+        base = self.tmp / "fresh"
+        done = run_script("finops_record.py", "init", "--base", base, *self.INIT, *periods)
+        return done, list(base.glob("*")) if base.is_dir() else []
+
+    def test_marking_a_change_on_a_day_that_does_not_exist_is_a_usage_error(self):
+        done = run_script("finops_compare.py", "mark", self.run_dir, "--id", "O-12", "--state", "implemented", "--on", "2026-02-30")
+        self.assertEqual(done.returncode, 2, done.stderr)
+        self.assertNotIn("Traceback", done.stderr)
+
+    def test_a_run_cannot_start_for_a_month_that_does_not_exist(self):
+        for periods in (("--period", "2026-13"), ("--period", "2026-10", "--comparison", "2026-00")):
+            with self.subTest(periods=periods):
+                done, created = self.init(*periods)
+                self.assertEqual(done.returncode, 2, done.stderr)
+                self.assertNotIn("Traceback", done.stderr)
+                self.assertEqual(created, [])
+
+    def test_a_window_needs_real_days_in_order(self):
+        for period in ("2026-02-30_2026-03-05", "2026-10-31_2026-10-01"):
+            with self.subTest(period=period):
+                done, created = self.init("--period", period)
+                self.assertEqual(done.returncode, 2, done.stderr)
+                self.assertEqual(created, [])
+
+    def test_real_periods_still_start_a_run(self):
+        for period in ("2026-10", "2026-10-01_2026-10-15"):
+            with self.subTest(period=period):
+                done, _ = self.init("--period", period)
+                self.assertEqual(done.returncode, 0, done.stderr)

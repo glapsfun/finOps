@@ -266,12 +266,14 @@ def display_number(value: str) -> str:
     """Thousands separators and readable decimals. For display only, never for math."""
     if value == UNDEFINED:
         return UNDEFINED
-    text = format(Decimal(value), "f")
-    if "." in text:
-        whole, fraction = text.split(".")
-        if len(fraction) > 2:
-            fraction = fraction[:6].rstrip("0").ljust(2, "0")
-        text = f"{whole}.{fraction}"
+    number = Decimal(value)
+    text = format(number, "f")
+    if "." in text and len(text.split(".")[1]) > 2:
+        # Six places, or as many as a small rate needs to keep three significant digits.
+        places = 6 if number == 0 else max(6, 2 - number.adjusted())
+        rounded = number.quantize(Decimal(1).scaleb(-places), rounding=ROUND_HALF_UP)
+        whole, fraction = format(rounded, "f").split(".")
+        text = f"{whole}.{fraction.rstrip('0').ljust(2, '0')}"
     return format(Decimal(text), ",f")
 
 

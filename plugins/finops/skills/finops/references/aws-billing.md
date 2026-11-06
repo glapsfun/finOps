@@ -69,7 +69,8 @@ scripts/finops_aws.py athena <run_dir> --workgroup finops --database billing \
   that cancels the query, and cancelled queries are still charged. After each query the script
   reads the scanned bytes, and it refuses the next query once the budget is used up. Without a
   workgroup limit, one query can overshoot. If a query's status is lost, or it outlives the wait, it
-  stays pending: the next query checks it first and charges it, and won't start until it finishes.
+  stays pending: the next query checks it first, charges it and records its result, and won't start
+  until it finishes. Running the same command again collects that result instead of a second query.
 - **Cost Explorer:** each request costs $0.01, and the script counts every page. Hourly
   granularity isn't offered, because it has its own charge. A budget stop with a page pending
   marks the evidence incomplete, and incomplete evidence can't back a figure.

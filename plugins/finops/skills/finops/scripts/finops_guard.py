@@ -48,6 +48,8 @@ def _strip_comments_and_strings(sql: str) -> str:
             end = sql.find("*/", index + 2)
             if end == -1:
                 raise GuardError("unterminated comment")
+            # A comment separates tokens, so removing it can't join the words around it.
+            out.append(" ")
             index = end + 2
         elif character in "'\"`":
             index = _skip_quoted(sql, index, character)
@@ -228,10 +230,14 @@ def record_use(run_dir: Path, kind: str, amount: int) -> None:
         run["budget"]["used"][kind] += amount
 
 
-def add_pending(run_dir: Path, engine: str, job_id: str, estimate: int = 0) -> None:
-    """Notes a started query, so its cost still counts if this script loses track of it."""
+def add_pending(run_dir: Path, engine: str, job_id: str, estimate: int = 0, query: dict | None = None) -> None:
+    """Notes a started query, so its cost still counts if this script loses track of it.
+    `query` is what a later call needs to record the result as evidence."""
+    entry = {"engine": engine, "job_id": job_id, "estimate": estimate}
+    if query is not None:
+        entry["query"] = query
     with updating(run_dir) as run:
-        run["budget"].setdefault("pending", []).append({"engine": engine, "job_id": job_id, "estimate": estimate})
+        run["budget"].setdefault("pending", []).append(entry)
 
 
 def clear_pending(run_dir: Path, job_id: str) -> None:
@@ -240,17 +246,19 @@ def clear_pending(run_dir: Path, job_id: str) -> None:
         run["budget"]["pending"] = [item for item in run["budget"].get("pending", []) if item.get("job_id") != job_id]
 
 
-def settle_query(run_dir: Path, kind: str, job_id: str, amount: int) -> None:
+def settle_query(run_dir: Path, kind: str, job_id: str, amount: int) -> bool:
     """Charges a started query and stops tracking it, as one step. Two overlapping calls
-    can both see it finish, and only the first one that gets here charges it."""
+    can both see it finish, and only the first one that gets here charges it. True for that one."""
     if kind not in BUDGET_KINDS:
         raise BudgetError(f"unknown budget kind: {kind}")
     with updating(run_dir) as run:
         pending = run["budget"].get("pending", [])
         remaining = [item for item in pending if item.get("job_id") != job_id]
-        if len(remaining) != len(pending):
+        charged = len(remaining) != len(pending)
+        if charged:
             run["budget"]["used"][kind] += amount
             run["budget"]["pending"] = remaining
+    return charged
 
 
 def pending_queries(run_dir: Path, engine: str) -> list:

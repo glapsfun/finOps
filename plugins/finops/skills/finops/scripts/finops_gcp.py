@@ -136,32 +136,89 @@ def _job_statistics(args, job_id: str, estimate: int) -> tuple:
         return estimate, None
 
 
-def _settle_pending(args) -> str | None:
-    """Charges jobs an earlier call lost track of. Returns why a new one can't start."""
+def _record_result(args, job_id: str, out: str, billed: int, query: dict) -> None:
+    table = list(csv.reader(io.StringIO(out)))
+    rows = max(len(table) - 1, 0)
+    truncated = rows >= MAX_ROWS
+    evidence_id = add_evidence(
+        args.run_dir,
+        kind="billing",
+        source=query["source"],
+        command=f"bq --project_id={args.project} --location={args.location} query --job_id={job_id}",
+        raw=out.encode(),
+        ext="csv",
+        query_text=query["sql"],
+        identity=_identity(),
+        job_id=job_id,
+        used=fmt_bytes(billed),
+        basis=query["basis"],
+        complete=not truncated,
+        rows=rows,
+        role="query",
+        period=query["period"],
+    )
+    show_result(args.run_dir, evidence_id, query["name"], out)
+    if truncated:
+        gap(f"{query['name']} reached {MAX_ROWS} rows and may be truncated, so it can't back a figure", args.run_dir)
+    else:
+        empty_result_gap(", ".join(filter(None, [query["name"], query["period"]])), table or [[]], args.run_dir)
+
+
+def _collect(args, job_id: str, billed: int, query: dict) -> bool:
+    """Reads the rows of a job that finished unseen. True when evidence was written."""
+    code, out, err = run_cli(_bq(args, "--format=csv") + ["head", "-j", f"--max_rows={MAX_ROWS}", job_id])
+    if code:
+        reason = failure_reason(f"bq head -j {job_id}", code, f"{err}\n{out}")
+        gap(f"BigQuery job {job_id} finished and was charged, but its result couldn't be read. {reason}", args.run_dir)
+        return False
+    _record_result(args, job_id, out, billed, query)
+    return True
+
+
+def _settle_pending(args, sql: str) -> tuple:
+    """Charges jobs an earlier call lost track of, and records their results.
+    Returns why a new query can't start, and whether this same query was just collected."""
+    collected = False
     for item in pending_queries(args.run_dir, "bigquery"):
         job = item["job_id"]
+        succeeded = False
         code, out, _ = run_cli(_bq(args, "--format=json") + ["show", "-j", job])
         try:
             if code:
                 raise ValueError(job)
             body = json.loads(out)
             if body.get("status", {}).get("state") != "DONE":
-                return f"BigQuery job {job} is still running, so its use is unknown. Try again when it finishes"
+                return f"BigQuery job {job} is still running, so its use is unknown. Try again when it finishes", collected
             # A job that failed has no query statistics, and bills nothing.
             billed = int(body.get("statistics", {}).get("query", {}).get("totalBytesBilled", 0))
+            succeeded = not body["status"].get("errorResult")
         except (ValueError, KeyError, TypeError, AttributeError):
             # It may never have started, but counting too much is the safe side of a budget.
             billed = int(item.get("estimate", 0))
             add_gap(args.run_dir, f"couldn't read BigQuery job {job}, so the budget records its dry-run estimate")
-        settle_query(args.run_dir, "bigquery_bytes", job, billed)
-    return None
+        charged = settle_query(args.run_dir, "bigquery_bytes", job, billed)
+        query = item.get("query")
+        if charged and succeeded and query and _collect(args, job, billed, query) and query["sql"] == sql:
+            collected = True
+    return None, collected
+
+
+def _within_budget(args) -> int:
+    try:
+        require_budget(load_run(args.run_dir), "bigquery_bytes", 0)
+    except BudgetError as exc:
+        return _budget_stop(exc)
+    return 0
 
 
 def cmd_query(args) -> int:
     sql = _prepared(args)
-    unsettled = _settle_pending(args)
+    unsettled, collected = _settle_pending(args, sql)
     if unsettled:
         return _budget_stop(unsettled)
+    # The result this command asks for was already paid for, so it isn't run again.
+    if collected:
+        return _within_budget(args)
     try:
         remaining = require_budget(load_run(args.run_dir), "bigquery_bytes", 1)
     except BudgetError as exc:
@@ -176,10 +233,18 @@ def cmd_query(args) -> int:
     job_id = f"finops-{uuid.uuid4().hex}"
     flags = ["--format=csv", f"--job_id={job_id}"]
     query_flags = ["--use_legacy_sql=false", f"--maximum_bytes_billed={remaining}", f"--max_rows={MAX_ROWS}"]
-    add_pending(args.run_dir, "bigquery", job_id, estimate)
+    params = parse_params(args.param)
+    query = {
+        "name": args.query_file.name,
+        "sql": sql,
+        "source": args.source or f"BigQuery, {args.query_file.stem}",
+        "basis": args.basis or default_basis(args.query_file),
+        "period": params.get("invoice_month", ""),
+    }
+    add_pending(args.run_dir, "bigquery", job_id, estimate, query=query)
     code, out, err = run_cli(_bq(args, *flags) + ["query", *query_flags, strip_leading_comments(sql)])
     if code == TIMED_OUT:
-        gap(f"BigQuery job {job_id} timed out here and may still be running. Its use isn't counted yet, and the next query checks it first. Don't start it again", args.run_dir)
+        gap(f"BigQuery job {job_id} timed out here and may still be running. Its use isn't counted yet. Run this same command again once it finishes to collect its result, which won't start a second query", args.run_dir)
         return 0
     if code:
         details = f"{err}\n{out}"
@@ -187,7 +252,7 @@ def cmd_query(args) -> int:
             clear_pending(args.run_dir, job_id)
             return _budget_stop(f"bigquery_bytes: {args.query_file.name} would be billed more than the {remaining} remaining, and failed without charge")
         # The client names the job, so it can exist and bill even though bq exited non-zero.
-        gap(f"{failure_reason(f'bq query {args.query_file.name}', code, details)}. BigQuery job {job_id} may have started anyway. Its use isn't counted yet, and the next query checks it first", args.run_dir)
+        gap(f"{failure_reason(f'bq query {args.query_file.name}', code, details)}. BigQuery job {job_id} may have started anyway. Its use isn't counted yet. Run this same command again to check it: a job that finished is collected, not started a second time", args.run_dir)
         return 0
 
     billed, reservation = _job_statistics(args, job_id, estimate)
@@ -195,38 +260,8 @@ def cmd_query(args) -> int:
     if reservation:
         add_gap(args.run_dir, "this project uses capacity pricing, so bytes billed have no direct dollar meaning")
 
-    table = list(csv.reader(io.StringIO(out)))
-    rows = max(len(table) - 1, 0)
-    truncated = rows >= MAX_ROWS
-    params = parse_params(args.param)
-    evidence_id = add_evidence(
-        args.run_dir,
-        kind="billing",
-        source=args.source or f"BigQuery, {args.query_file.stem}",
-        command=f"bq --project_id={args.project} --location={args.location} query --job_id={job_id}",
-        raw=out.encode(),
-        ext="csv",
-        query_text=sql,
-        identity=_identity(),
-        job_id=job_id,
-        used=fmt_bytes(billed),
-        basis=args.basis or default_basis(args.query_file),
-        complete=not truncated,
-        rows=rows,
-        role="query",
-        period=params.get("invoice_month", ""),
-    )
-    show_result(args.run_dir, evidence_id, args.query_file.name, out)
-    if truncated:
-        gap(f"{args.query_file.name} reached {MAX_ROWS} rows and may be truncated, so it can't back a figure", args.run_dir)
-    else:
-        empty_result_gap(", ".join(filter(None, [args.query_file.name, params.get("invoice_month", "")])), table or [[]], args.run_dir)
-
-    try:
-        require_budget(load_run(args.run_dir), "bigquery_bytes", 0)
-    except BudgetError as exc:
-        return _budget_stop(exc)
-    return 0
+    _record_result(args, job_id, out, billed, query)
+    return _within_budget(args)
 
 
 def cmd_recommendations(args) -> int:

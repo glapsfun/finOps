@@ -73,7 +73,7 @@ result. The report renders values from those references, so it can't print one e
 | `LEDGER_SUM`, `LEDGER_KIND`, `POOL_SUM` | The Kubernetes ledger double-counts or loses cost |
 | `OVERLAP` | Two opportunities on one resource are summed, even through a nested sum. Use `overlap_savings` |
 | `OPPORTUNITY_FIELD` | An opportunity has no `resource`, or a `type` other than `rightsizing` or `other` |
-| `SAVINGS_KIND` | A saving rests on a measured figure, or the total isn't a calculation over the savings |
+| `SAVINGS_KIND` | A saving rests on a measured figure, or the total isn't a calculation that adds each counted opportunity once and nothing else |
 | `CAUSE_NO_EVIDENCE` | A stated cause cites nothing |
 | `PEAK_MISSING` | Rightsizing with no complete telemetry peak, and not marked `needs_investigation` |
 | `INVESTIGATE_IN_TOTAL` | An item that needs investigation counts toward the savings total |

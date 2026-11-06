@@ -345,8 +345,9 @@ class SpendOutlivingItsCheck(Runners):
         self.scenario.on("aws", "athena", "get-query-execution", "qid-1", stdout=execution("SUCCEEDED", 777))
         self.scenario.on("aws", "athena", "start-query-execution", stdout=json.dumps({"QueryExecutionId": "qid-2"}))
         self.scenario.on("aws", "athena", "get-query-execution", "qid-2", stdout=execution("SUCCEEDED", 5))
-        self.scenario.on("aws", "athena", "get-query-results", "qid-2", stdout=json.dumps({"ResultSet": {"Rows": [{"Data": [{"VarCharValue": "a"}]}, {"Data": [{"VarCharValue": "1"}]}]}}))
-        done = self.athena()
+        self.scenario.on("aws", "athena", "get-query-results", stdout=json.dumps({"ResultSet": {"Rows": [{"Data": [{"VarCharValue": "a"}]}, {"Data": [{"VarCharValue": "1"}]}]}}))
+        # Another query, since running the same one again collects qid-1 instead of starting qid-2.
+        done = self.aws("athena", self.run_dir, "--workgroup", "finops", "--database", "billing", "--query-file", SQL / "aws-cur2-effective.sql", "--param", "table=cur", "--param", "period=2026-10")
         self.assertEqual(done.returncode, 0, done.stdout)
         self.assertEqual(self.used("athena_bytes"), 782)
         self.assertEqual(load_run(self.run_dir)["budget"]["pending"], [])

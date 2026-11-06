@@ -39,7 +39,8 @@ NON_MONEY_OUTPUTS = {"pct", "savings_pct", "residual_pct", "months", "utilizatio
 QUANTITY_COLUMNS = {"quantity", "usage_amount"}
 MEASURED_EVIDENCE = {"billing", "telemetry"}
 ESTIMATED_EVIDENCE = {"recommendation", "allocation", "prior_run"}
-SAVINGS_TOTAL_CALCS = {"sum", "overlap_savings", "net_benefit"}
+# The one output of each calculation that is a monthly amount.
+SAVINGS_TOTAL_OUTPUTS = {"sum": "total", "overlap_savings": "savings", "net_benefit": "net"}
 
 _CALC_REF = re.compile(r"^(C\d+)\.(\w+)$")
 _MONEY = re.compile(r"[$€£]\s?\d|\b(?:USD|EUR|GBP)\s?\d|\d\s?(?:USD|EUR|GBP)\b")
@@ -454,6 +455,9 @@ class _Checker:
                 self.fail("RECON_ROLE", where, "an invoice is a figure, or a sum of invoice figures")
                 return
             names = terms
+        if len(set(names)) != len(names):
+            self.fail("RECON_ROLE", where, "the invoice sum counts a figure more than once")
+            return
 
         seen: dict = {}
         for name in names:
@@ -472,10 +476,12 @@ class _Checker:
             if len(evidence.get("currencies", [])) > 1:
                 self.fail("RECON_ROLE", where, f"{evidence.get('id')} holds invoices in {', '.join(evidence['currencies'])}, which can't be summed")
             path = figure.get("locator", {}).get("path", [])
-            seen.setdefault(evidence.get("id"), set()).add(tuple(path[:2]))
+            seen.setdefault(evidence.get("id"), []).append(tuple(path[:2]))
         for evidence_id, invoices in seen.items():
             rows = self.evidence[evidence_id].get("rows")
-            if rows is not None and len(invoices) != rows:
+            if len(set(invoices)) != len(invoices):
+                self.fail("RECON_ROLE", where, f"counts an invoice in {evidence_id} more than once")
+            elif rows is not None and len(invoices) != rows:
                 self.fail("RECON_ROLE", where, f"uses {len(invoices)} of the {rows} invoices in {evidence_id}")
 
     def query_role(self, where: str, ref: object, period: object) -> None:
@@ -606,8 +612,13 @@ class _Checker:
             if calc.get("inputs", {}).get("covered") != ledger.get("covered"):
                 self.fail("LEDGER_SUM", "kubernetes_ledger.covered", "covered charges differ from the ledger calculation's input")
 
+        spread: set = set()
         for index, distribution in enumerate(ledger.get("distributions", [])):
             self.distribution(f"kubernetes_ledger.distributions.{index}", distribution, rows)
+            spread.update(distribution.get("from_rows", [distribution.get("pool")]))
+        for index, row in enumerate(rows):
+            if row.get("distributed") and row.get("amount") not in spread:
+                self.fail("POOL_SUM", f"kubernetes_ledger.rows.{index}", "marked distributed, but no distribution spreads it, so its cost is lost")
 
     def distribution(self, where: str, distribution: dict, rows: list) -> None:
         calc = _find_calc(self.run, distribution.get("calc"))
@@ -615,6 +626,9 @@ class _Checker:
             self.fail("POOL_SUM", where, f"{distribution.get('calc')} isn't a pool distribution")
             return
         pool = distribution.get("pool")
+        split = calc.get("inputs", {}).get("pool")
+        if split != pool:
+            self.fail("POOL_SUM", where, f"{calc.get('id')} splits {split}, not the pool {pool}, so the difference is lost")
         sources = distribution.get("from_rows", [pool])
         amounts = {row.get("amount"): row for row in rows}
         for source in sources:
@@ -639,14 +653,56 @@ class _Checker:
         figures = self.run.get("figures", {})
         return bool(leaves) and all(figures.get(item, {}).get("kind") == "provided" for item in leaves)
 
+    def summed(self, ref: object, known: set, seen: frozenset = frozenset()) -> list:
+        """The terms a reference adds up, following nested sums down to anything in `known`."""
+        match = _CALC_REF.match(ref) if isinstance(ref, str) else None
+        calc = _find_calc(self.run, match.group(1)) if match else None
+        if calc is None or ref in known or calc.get("name") != "sum" or match.group(2) != "total" or calc.get("id") in seen:
+            return [ref]
+        terms: list = []
+        for term in calc.get("inputs", {}).get("terms", []):
+            terms.extend(self.summed(term, known, seen | {calc.get("id")}))
+        return terms
+
+    def savings_total(self, total_ref: object) -> None:
+        """The heading's total adds every opportunity that counts, once, and nothing else."""
+        match = _CALC_REF.match(total_ref) if isinstance(total_ref, str) else None
+        calc = _find_calc(self.run, match.group(1)) if match else None
+        if calc is None or SAVINGS_TOTAL_OUTPUTS.get(calc.get("name")) != match.group(2):
+            self.fail("SAVINGS_KIND", "savings_total", "the savings total must be a calculation over the opportunities")
+            return
+
+        def stands_for(item: dict) -> set:
+            overlap = item.get("overlap_calc")
+            return {ref for ref in (item.get("monthly"), f"{overlap}.savings" if overlap else None) if isinstance(ref, str)}
+
+        items = self.run.get("opportunities", [])
+        known = set().union(*(stands_for(item) for item in items))
+        source = calc.get("inputs", {}).get("savings") if calc.get("name") == "net_benefit" else total_ref
+        terms = self.summed(source, known)
+        extra = [str(term.get("literal")) if _is_literal(term) else str(term) for term in terms if not isinstance(term, str) or term not in known]
+        if extra:
+            self.fail("SAVINGS_KIND", "savings_total", f"adds {', '.join(extra)}, which no opportunity lists as its saving")
+        counted = [term for term in terms if isinstance(term, str)]
+        repeated = sorted({term for term in counted if counted.count(term) > 1})
+        if repeated:
+            self.fail("SAVINGS_KIND", "savings_total", f"counts {', '.join(repeated)} more than once")
+        for item in items:
+            if item.get("needs_investigation"):
+                continue
+            found = stands_for(item) & set(counted)
+            where = f"opportunities.{item.get('id')}"
+            if stands_for(item) and not found:
+                self.fail("SAVINGS_KIND", where, "isn't in the savings total, so the heading disagrees with the rows under it")
+            elif len(found) > 1:
+                self.fail("SAVINGS_KIND", where, "counts in the savings total both alone and through its overlap calculation")
+
     def opportunities(self) -> None:
         total_ref = self.run.get("savings_total")
         self.check_ref("savings_total", total_ref)
         total_refs = self.all_refs(total_ref) if total_ref else set()
-        match = _CALC_REF.match(total_ref) if isinstance(total_ref, str) else None
-        calc = _find_calc(self.run, match.group(1)) if match else None
-        if total_ref is not None and (calc is None or calc.get("name") not in SAVINGS_TOTAL_CALCS):
-            self.fail("SAVINGS_KIND", "savings_total", "the savings total must be a calculation over the opportunities")
+        if total_ref is not None:
+            self.savings_total(total_ref)
 
         by_resource: dict = {}
         for item in self.run.get("opportunities", []):

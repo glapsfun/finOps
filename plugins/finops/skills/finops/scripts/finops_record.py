@@ -68,8 +68,17 @@ def _utc_now() -> str:
 
 
 def _check_period(label: str, period: str) -> None:
-    if _MONTH.match(period) or _WINDOW.match(period):
-        return
+    window = _WINDOW.match(period)
+    try:
+        if window:
+            if date.fromisoformat(window.group(1)) > date.fromisoformat(window.group(2)):
+                raise RecordError(f"{label} ends before it starts: {period!r}")
+            return
+        if _MONTH.match(period):
+            date.fromisoformat(f"{period}-01")
+            return
+    except ValueError as exc:
+        raise RecordError(f"{label} isn't a real date: {period!r}") from exc
     raise RecordError(f"{label} must be YYYY-MM or YYYY-MM-DD_YYYY-MM-DD, got {period!r}")
 
 
