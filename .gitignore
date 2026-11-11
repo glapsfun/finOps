@@ -222,3 +222,12 @@ _bmad/
 _bmad-output/
 .agents/skills/bmad-*/
 .claude/skills/bmad-*/
+
+# The Python template above ignores lib/, but these are shell helpers
+!scripts/lib/
+
+# Reports hold real spend figures
+docs/finops/
+
+# Local notes
+.docs

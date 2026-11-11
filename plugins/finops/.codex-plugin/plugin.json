@@ -1,0 +1,42 @@
+{
+  "name": "finops",
+  "version": "0.1.0",
+  "description": "Answers cloud cost questions on AWS, GCP, and Kubernetes: why a bill went up, whether analysis matches an invoice, where to save money, and a recurring report compared with the last one. Every number in a report is proved against saved query results.",
+  "author": {
+    "name": "vladtara",
+    "email": "vlad@glaps.fun",
+    "url": "https://github.com/glapsfun"
+  },
+  "homepage": "https://github.com/glapsfun/finOps",
+  "repository": "https://github.com/glapsfun/finOps",
+  "license": "MIT",
+  "keywords": [
+    "finops",
+    "cloud-cost",
+    "billing",
+    "aws",
+    "gcp",
+    "kubernetes",
+    "opencost",
+    "kubecost"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "FinOps",
+    "shortDescription": "Answer cloud cost questions with numbers a script has proved",
+    "longDescription": "Use FinOps to answer cloud cost questions on AWS, GCP, and Kubernetes: it finds which billing data exists, asks once for a query budget, reconciles to the invoice, explains what changed, and reports savings. Every number in a report is proved against saved query results before the report is written.",
+    "developerName": "vladtara",
+    "category": "Developer Tools",
+    "capabilities": ["Interactive", "Read", "Write"],
+    "websiteURL": "https://github.com/glapsfun/finOps",
+    "privacyPolicyURL": "https://github.com/glapsfun/finOps",
+    "termsOfServiceURL": "https://github.com/glapsfun/finOps",
+    "defaultPrompt": [
+      "Use finops to find out why my cloud bill went up.",
+      "Use finops to reconcile my GCP invoice with the billing export.",
+      "Use finops to find where we can save money."
+    ],
+    "brandColor": "#D9480F",
+    "screenshots": []
+  }
+}
